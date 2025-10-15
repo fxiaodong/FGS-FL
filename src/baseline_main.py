@@ -1,9 +1,7 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-# Python version: 3.6
+'''baseline.py：集中式训练基线（对比实验）
+该文件实现 “传统集中式 SGD 训练”，用于与联邦训练对比，凸显 FedAvg 的 “去中心化” 优势'''
 
-
-from tqdm import tqdm
+# from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 import torch
@@ -16,17 +14,19 @@ from models import MLP, CNNMnist, CNNFashion_Mnist, CNNCifar
 
 
 if __name__ == '__main__':
+    # 解析命令行参数
     args = args_parser()
+    # 设置GPU设备
     if args.gpu:
         torch.cuda.set_device(args.gpu)
     device = 'cuda' if args.gpu else 'cpu'
 
-    # load datasets
+    # 加载训练和测试数据集
     train_dataset, test_dataset, _ = get_dataset(args)
 
-    # BUILD MODEL
+    # 构建全局模型
     if args.model == 'cnn':
-        # Convolutional neural netork
+        # 卷积神经网络模型
         if args.dataset == 'mnist':
             global_model = CNNMnist(args=args)
         elif args.dataset == 'fmnist':
@@ -34,7 +34,7 @@ if __name__ == '__main__':
         elif args.dataset == 'cifar':
             global_model = CNNCifar(args=args)
     elif args.model == 'mlp':
-        # Multi-layer preceptron
+        # 多层感知机模型
         img_size = train_dataset[0][0].shape
         len_in = 1
         for x in img_size:
@@ -44,13 +44,12 @@ if __name__ == '__main__':
     else:
         exit('Error: unrecognized model')
 
-    # Set the model to train and send it to device.
+    # 将模型设置为训练模式并移至指定设备
     global_model.to(device)
     global_model.train()
     print(global_model)
 
-    # Training
-    # Set optimizer and criterion
+    # 训练准备：设置优化器和损失函数
     if args.optimizer == 'sgd':
         optimizer = torch.optim.SGD(global_model.parameters(), lr=args.lr,
                                     momentum=0.5)
@@ -62,7 +61,8 @@ if __name__ == '__main__':
     criterion = torch.nn.NLLLoss().to(device)
     epoch_loss = []
 
-    for epoch in tqdm(range(args.epochs)):
+    # 模型训练过程
+    for epoch in range(args.epochs):
         batch_loss = []
 
         for batch_idx, (images, labels) in enumerate(trainloader):
@@ -84,7 +84,7 @@ if __name__ == '__main__':
         print('\nTrain loss:', loss_avg)
         epoch_loss.append(loss_avg)
 
-    # Plot loss
+    # 绘制训练损失曲线
     plt.figure()
     plt.plot(range(len(epoch_loss)), epoch_loss)
     plt.xlabel('epochs')
@@ -92,7 +92,8 @@ if __name__ == '__main__':
     plt.savefig('../save/nn_{}_{}_{}.png'.format(args.dataset, args.model,
                                                  args.epochs))
 
-    # testing
+    # 模型测试
     test_acc, test_loss = test_inference(args, global_model, test_dataset)
     print('Test on', len(test_dataset), 'samples')
     print("Test Accuracy: {:.2f}%".format(100*test_acc))
+
