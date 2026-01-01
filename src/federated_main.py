@@ -1,164 +1,168 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Python version: 3.6
-
-# 该文件是联邦训练的 “顶层控制器”，完整复现论文中 FedAvg 算法的 “服务器 - 客户端” 交互流程
-
-import os
-import copy
-import time
-import pickle
+import os, copy, time, datetime
 import numpy as np
-# from tqdm import tqdm
-
 import torch
-from tensorboardX import SummaryWriter
-
+import gc
 from options import args_parser
 from update import LocalUpdate, test_inference
-from models import MLP, CNNMnist, CNNFashion_Mnist, CNNCifar
-from utils import get_dataset, average_weights, exp_details
+from utils import (get_dataset, init_uav_and_gt, choose_optimal_ro,
+                   aggregate_payloads, exp_details, build_global_model)
+from models import get_fc_rank, get_fc_layer
+
+
+def compute_model_size_bits(model):
+    return sum(p.numel() for p in model.parameters()) * 32
+
+
+def main():
+    args = args_parser()
+    # 强制修正学习率以保证实验稳健性
+    if args.lr < 0.01: args.lr = 0.01
+
+    device = torch.device(f'cuda:{args.gpu}' if args.gpu and args.gpu != 'None' else 'cpu')
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ========== 1. Init Data & Env ==========
+    train_dataset, test_dataset, user_groups = get_dataset(args)
+    args.uav_coord, args.gt_coords, args.gt_rates = init_uav_and_gt(args)
+
+    # ========== 2. 模型分析 ==========
+    tmp_model = build_global_model(args).to(device)
+    full_model_size_bits = compute_model_size_bits(tmp_model)
+
+    # 【关键修改】：更鲁棒的层解析逻辑
+    # 判定是否为“消融实验 3”：即关闭 LRP 压缩
+    is_lrp_disabled = args.compress_layers is None or args.compress_layers.lower() in ['none', '']
+
+    if is_lrp_disabled:
+        target_layers = []
+        args.compression_rate = 1.0
+        # 如果不压缩，所有用户默认执行全量传输 (X=1)
+        args.optimal_X = np.ones(args.num_users)
+        print(">>> 模式：全量通信（Exp 3 消融实验：关闭 LRP 压缩）")
+    else:
+        target_layers = [lyr.strip() for lyr in args.compress_layers.split(',') if lyr.strip()]
+
+    raw_total_fc_params = 0
+    comp_total_fc_params = 0
+    found_any_layer = False
+
+    # ========== 3. 压缩率计算与 PSO 优化 ==========
+    if target_layers:
+        for layer_name in target_layers:
+            fc_layer = get_fc_layer(tmp_model, layer_name)
+            if fc_layer:
+                in_feats, out_feats = fc_layer.in_features, fc_layer.out_features
+                raw_total_fc_params += (in_feats * out_feats)
+                actual_k = min(args.compress_rank, in_feats, out_feats)
+                comp_total_fc_params += (in_feats * actual_k + actual_k * out_feats)
+                found_any_layer = True
+
+        if found_any_layer:
+            fixed_part_bits = full_model_size_bits - (raw_total_fc_params * 32)
+            compressed_full_size_bits = fixed_part_bits + (comp_total_fc_params * 32)
+            args.compression_rate = compressed_full_size_bits / full_model_size_bits
+            print(f">>> 模式：模型压缩开启，目标层: {target_layers}, 压缩率: {args.compression_rate:.4f}")
+
+            # 只有在真正开启压缩层时，才运行 PSO 优化
+            args.use_csmc = 1 if args.strategy in ['csmcFL', 'fgs_csmcFL'] else 0
+            if args.use_csmc:
+                _, args.optimal_X, _ = choose_optimal_ro(args, args.gt_rates, full_model_size_bits)
+        else:
+            args.compression_rate = 1.0
+            args.optimal_X = np.ones(args.num_users)
+            print(">>> 警告：未找到指定压缩层，切换为全量通信模式")
+
+    # 打印实验细节
+    exp_details(args)
+
+    # 正式训练使用的全局模型
+    global_model = build_global_model(args).to(device)
+    user_histories = {i: [] for i in range(args.num_users)}
+
+    test_acc_list, cumulative_bits_list = [], []
+    total_bits = 0.0
+    best_acc = 0.0
+
+    # ========== 4. Training Loop ==========
+    for epoch in range(args.epochs):
+        # 学习率衰减策略
+        if epoch > 0 and epoch % 20 == 0:
+            new_lr = args.lr * 0.7
+            args.lr = max(new_lr, 0.004)
+            print(f'>>> Learning rate adjusted to: {args.lr:.6f}')
+
+        print(f'Round {epoch + 1}/{args.epochs} | Strategy: {args.strategy}')
+
+        # 动态调整压缩秩 (40-50轮预热后强化特征捕获)
+        original_rank = args.compress_rank
+        if 40 <= epoch < 50:
+            args.compress_rank = original_rank * 2
+        else:
+            args.compress_rank = original_rank
+
+        selected_users = np.arange(args.num_users)
+        local_payloads, round_train_losses = [], []
+        comp_user_count = 0
+
+        for idx in selected_users:
+            # 判定当前用户是否执行压缩
+            # 逻辑：非预热期 & 策略开启压缩 & PSO 判定该用户信道差 (X=0)
+            is_comp = False if epoch < 40 else (
+                        not is_lrp_disabled and args.strategy in ['csmcFL', 'fgs_csmcFL'] and args.optimal_X[idx] == 0)
+            if is_comp: comp_user_count += 1
+
+            local_trainer = LocalUpdate(args=args, dataset=train_dataset, idxs=user_groups[idx])
+            payload, loss, updated_history = local_trainer.update_weights(
+                model=copy.deepcopy(global_model),
+                global_round=epoch,
+                compress=is_comp,
+                epsilon=args.epsilon,
+                history=user_histories[idx]
+            )
+            user_histories[idx] = updated_history
+            local_payloads.append(payload)
+            round_train_losses.append(loss)
+
+            # 比特统计：基于实际是否压缩计算
+            current_bits = full_model_size_bits * (args.compression_rate if is_comp else 1.0)
+            total_bits += current_bits
+
+        # 聚合
+        if local_payloads:
+            agg_result = aggregate_payloads(local_payloads)
+            global_model.load_state_dict(agg_result, strict=True)
+
+        # 测试
+        acc, test_loss = test_inference(args, global_model, test_dataset)
+        test_acc_list.append(acc)
+        cumulative_bits_list.append(total_bits)
+
+        if acc > best_acc:
+            best_acc = acc
+
+        avg_train_loss = sum(round_train_losses) / len(round_train_losses)
+        print(f'   [Loss] Train: {avg_train_loss:.4f} | Test: {test_loss:.4f}')
+        print(f'   [Stat] Test Acc: {acc:.2%} | Best: {best_acc:.2%} | Comm: {total_bits / 1e6:.2f}Mb' +
+              (f" | CompUsers: {comp_user_count}" if epoch >= 40 else ""))
+
+        # 还原 Rank
+        args.compress_rank = original_rank
+
+    # ========== 5. Save Results ==========
+    save_dir = '../save/results/'
+    if not os.path.exists(save_dir): os.makedirs(save_dir)
+    timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
+    iid_tag = 'iid' if args.iid else 'noniid'
+    # 文件名增加 rho 标识，方便绘图脚本自动识别消融实验
+    file_name = f"{args.strategy}_{args.dataset}_{iid_tag}_eps{args.epsilon}_rho{args.rho}_rank{args.compress_rank}_{timestamp}.pth"
+
+    results = {'args': vars(args), 'test_acc': test_acc_list, 'cumulative_bits': cumulative_bits_list}
+    torch.save(results, os.path.join(save_dir, file_name))
+    print(f"\nTraining Finished. Max Acc: {max(test_acc_list):.2%}")
 
 
 if __name__ == '__main__':
-    start_time = time.time()
-
-    # define paths
-    path_project = os.path.abspath('..')
-    logger = SummaryWriter('../logs')
-
-    args = args_parser()# 解析参数
-    exp_details(args)# 打印实验细节
-
-    if args.gpu:
-        torch.cuda.set_device(args.gpu)
-    device = 'cuda' if args.gpu else 'cpu'
-
-    #  加载数据集和客户端数据划分
-    train_dataset, test_dataset, user_groups = get_dataset(args)
-
-    # 构建全局模型（对应论文 w_0）
-    if args.model == 'cnn':
-        # Convolutional neural netork
-        if args.dataset == 'mnist':
-            global_model = CNNMnist(args=args)
-        elif args.dataset == 'fmnist':
-            global_model = CNNFashion_Mnist(args=args)
-        elif args.dataset == 'cifar':
-            global_model = CNNCifar(args=args)
-
-    elif args.model == 'mlp':
-        # Multi-layer preceptron
-        img_size = train_dataset[0][0].shape
-        len_in = 1
-        for x in img_size:
-            len_in *= x
-            global_model = MLP(dim_in=len_in, dim_hidden=64,
-                               dim_out=args.num_classes)
-    else:
-        exit('Error: unrecognized model')
-
-    # Set the model to train and send it to device.
-    global_model.to(device)
-    global_model.train()
-    print(global_model)
-
-    #  初始化全局权重
-    global_weights = global_model.state_dict()
-
-    # 全局训练循环（对应论文 “每轮通信”）
-    train_loss, train_accuracy = [], [] # 全局轮次循环（论文 T 轮）
-    val_acc_list, net_list = [], []
-    cv_loss, cv_acc = [], []
-    print_every = 2
-    val_loss_pre, counter = 0, 0
-
-    for epoch in range(args.epochs):
-        local_weights, local_losses = [], []
-        print(f'\n | Global Training Round : {epoch+1} |\n')
-
-        global_model.train()
-        # 1. 选择客户端（对应论文“随机选择 C×K 个客户端”）
-        m = max(int(args.frac * args.num_users), 1)
-        # 随机选客户端
-        idxs_users = np.random.choice(range(args.num_users), m, replace=False)
-        # 2. 客户端本地训练（并行执行，论文中“客户端独立训练”）
-        for idx in idxs_users:
-            local_model = LocalUpdate(args=args, dataset=train_dataset,
-                                      idxs=user_groups[idx], logger=logger)
-            # 本地训练：返回更新后的权重和损失
-            w, loss = local_model.update_weights(
-                model=copy.deepcopy(global_model), global_round=epoch)
-            local_weights.append(copy.deepcopy(w))  # 收集客户端权重
-            local_losses.append(copy.deepcopy(loss))  # 收集客户端损失
-
-        # 3. 服务器聚合权重（对应论文“加权平均生成 w_{t+1}”）
-        global_weights = average_weights(local_weights)
-
-        # 更新全局模型
-        global_model.load_state_dict(global_weights)
-
-        # 4. 记录训练损失和准确率
-        loss_avg = sum(local_losses) / len(local_losses)
-        train_loss.append(loss_avg)
-
-        # # 计算所有客户端的平均训练准确率
-        list_acc, list_loss = [], []
-        global_model.eval()
-        for c in range(args.num_users):
-            local_model = LocalUpdate(args=args, dataset=train_dataset,
-                                      idxs=user_groups[idx], logger=logger)
-            acc, loss = local_model.inference(model=global_model)
-            list_acc.append(acc)
-            list_loss.append(loss)
-        train_accuracy.append(sum(list_acc)/len(list_acc))
-
-        # print global training loss after every 'i' rounds
-        if (epoch+1) % print_every == 0:
-            print(f' \nAvg Training Stats after {epoch+1} global rounds:')
-            print(f'Training Loss : {np.mean(np.array(train_loss))}')
-            print('Train Accuracy: {:.2f}% \n'.format(100*train_accuracy[-1]))
-
-    # T全局训练结束后，在测试集评估模型
-    test_acc, test_loss = test_inference(args, global_model, test_dataset)
-
-    print(f' \n Results after {args.epochs} global rounds of training:')
-    print("|---- Avg Train Accuracy: {:.2f}%".format(100*train_accuracy[-1]))
-    print("|---- Test Accuracy: {:.2f}%".format(100*test_acc))
-
-    # 保存训练损失和准确率（用于后续绘图）
-    file_name = '../save/objects/{}_{}_{}_C[{}]_iid[{}]_E[{}]_B[{}].pkl'.\
-        format(args.dataset, args.model, args.epochs, args.frac, args.iid,
-               args.local_ep, args.local_bs)
-
-    with open(file_name, 'wb') as f:
-        pickle.dump([train_loss, train_accuracy], f)
-
-    print('\n Total Run Time: {0:0.4f}'.format(time.time()-start_time))
-
-    # PLOTTING (optional)
-    import matplotlib
-
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-
-    # Plot Loss curve
-    plt.figure()
-    plt.title('Training Loss vs Communication rounds')
-    plt.plot(range(len(train_loss)), train_loss, color='r')
-    plt.ylabel('Training loss')
-    plt.xlabel('Communication Rounds')
-    plt.savefig('../save/fed_{}_{}_{}_C[{}]_iid[{}]_E[{}]_B[{}]_loss.png'.
-                format(args.dataset, args.model, args.epochs, args.frac,
-                       args.iid, args.local_ep, args.local_bs))
-
-    # Plot Average Accuracy vs Communication rounds
-    plt.figure()
-    plt.title('Average Accuracy vs Communication rounds')
-    plt.plot(range(len(train_accuracy)), train_accuracy, color='k')
-    plt.ylabel('Average Accuracy')
-    plt.xlabel('Communication Rounds')
-    plt.savefig('../save/fed_{}_{}_{}_C[{}]_iid[{}]_E[{}]_B[{}]_acc.png'.
-                format(args.dataset, args.model, args.epochs, args.frac,
-                       args.iid, args.local_ep, args.local_bs))
+    main()
