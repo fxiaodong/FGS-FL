@@ -1,86 +1,88 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Python version: 3.6
-
-# options.py：超参数配置（对应论文 FedAvg 关键参数）
-# 该文件定义了所有实验参数，直接映射论文中的核心变量，是控制实验场景的入口
-
 import argparse
 
 
 def args_parser():
     parser = argparse.ArgumentParser()
 
-    # 1. 联邦核心参数（对应论文 FedAvg 算法参数）
-    # 全局轮数
-    parser.add_argument('--epochs', type=int, default=10,
-                        help="number of rounds of training")
-    # 客户端数量
-    parser.add_argument('--num_users', type=int, default=100,
-                        help="number of users: K")
-    parser.add_argument('--frac', type=float, default=0.1,
-                        help='the fraction of clients: C')
-    parser.add_argument('--local_ep', type=int, default=10,
-                        help="the number of local epochs: E")
-    parser.add_argument('--local_bs', type=int, default=10,
-                        help="local batch size: B")
-    parser.add_argument('--lr', type=float, default=0.01,
-                        help='learning rate')
-    parser.add_argument('--momentum', type=float, default=0.5,
-                        help='SGD momentum (default: 0.5)')
+    # ========================== 1. 联邦学习核心参数 ==========================
+    parser.add_argument('--epochs', type=int, default=30, help="全局聚合轮数（论文R=30）")
+    parser.add_argument('--num_users', type=int, default=30, help="GT数量（论文M=30）")
+    parser.add_argument('--frac', type=float, default=1.0, help="客户端选择比例（psFL使用，csmcFL由算法自动决定）")
+    parser.add_argument('--local_ep', type=int, default=5, help="本地训练轮次（论文E=5）")
+    parser.add_argument('--local_bs', type=int, default=16, help="本地批大小（论文B=16）")
+    parser.add_argument('--lr', type=float, default=0.001, help="学习率（论文ε=0.001）")
+    parser.add_argument('--momentum', type=float, default=0.5, help='SGD动量')
 
-    # 2.模型与数据集参数（对应论文实验设置）
-    # --model: 指定要使用的模型名称，默认为'mlp'
-    # --kernel_num: 指定每种卷积核的数量，默认为9
-    # --kernel_sizes: 指定用于卷积操作的卷积核尺寸，以逗号分隔，默认为'3,4,5'
-    # --num_channels: 指定图像的通道数，默认为1
-    # --norm: 指定使用的归一化方法，可选'batch_norm'、'layer_norm'或'None'，默认为'batch_norm'
-    # --num_filters: 指定卷积网络中滤波器的数量，mini-imagenet建议32，omiglot建议64，默认为32
-    # --max_pool: 指定是否使用最大池化而不是步幅卷积，默认为'True'
-    parser.add_argument('--model', type=str, default='mlp', help='model name')
-    parser.add_argument('--kernel_num', type=int, default=9,
-                        help='number of each kind of kernel')
-    parser.add_argument('--kernel_sizes', type=str, default='3,4,5',
-                        help='comma-separated kernel size to \
-                        use for convolution')
-    parser.add_argument('--num_channels', type=int, default=1, help="number \
-                        of channels of imgs")
-    parser.add_argument('--norm', type=str, default='batch_norm',
-                        help="batch_norm, layer_norm, or None")
-    parser.add_argument('--num_filters', type=int, default=32,
-                        help="number of filters for conv nets -- 32 for \
-                        mini-imagenet, 64 for omiglot.")
-    parser.add_argument('--max_pool', type=str, default='True',
-                        help="Whether use max pooling rather than \
-                        strided convolutions")
+    # ========================== 2. 模型与数据集参数 ==========================
+    parser.add_argument('--model', type=str, default='cnn',
+                        choices=['cnn', 'mlp', 'lenet', 'alexnet'],
+                        help='模型类型。cnn会根据数据集自动匹配论文结构的LeNet5或AlexNet')
+    parser.add_argument('--dataset', type=str, default='mnist',
+                        choices=['mnist', 'fmnist', 'cifar'], help="数据集")
+    parser.add_argument('--num_classes', type=int, default=10, help="类别数")
+    parser.add_argument('--gpu', default='0', help="GPU ID (例如 '0')，若使用CPU请传 None")
+    parser.add_argument('--iid', type=int, default=1, help='1=IID, 0=Non-IID')
+    parser.add_argument('--seed', type=int, default=1, help='随机种子')
+    parser.add_argument('--classes_per_user', type=int, default=2,
+                        help='Non-IID 模式下每个客户端拥有的类别数 (1-10)')
 
-    # other arguments
-    # 添加数据集名称参数，默认为'mnist'
-    parser.add_argument('--dataset', type=str, default='mnist', help="name \
-                           of dataset")
-    # 添加类别数量参数，默认为10
-    parser.add_argument('--num_classes', type=int, default=10, help="number \
-                           of classes")
-    # 添加GPU设置参数，用于指定使用的GPU设备，默认使用CPU
-    parser.add_argument('--gpu', default=None, help="To use cuda, set \
-                           to a specific GPU ID. Default set to use CPU.")
-    # 添加优化器类型参数，默认为'sgd'
-    parser.add_argument('--optimizer', type=str, default='sgd', help="type \
-                           of optimizer")
-    # 添加数据分布设置参数，1表示IID分布，0表示non-IID分布，默认为IID
-    parser.add_argument('--iid', type=int, default=1,
-                        help='Default set to IID. Set to 0 for non-IID.')
-    # 添加non-IID设置下的数据分割方式参数，0表示等分，1表示不等分
-    parser.add_argument('--unequal', type=int, default=0,
-                        help='whether to use unequal data splits for  \
-                           non-i.i.d setting (use 0 for equal splits)')
-    # 添加早停轮数参数，用于控制训练提前停止的轮数，默认为10
-    parser.add_argument('--stopping_rounds', type=int, default=10,
-                        help='rounds of early stopping')
-    # 添加详细输出级别参数，控制程序运行时的输出详细程度，默认为1
-    parser.add_argument('--verbose', type=int, default=1, help='verbose')
-    # 添加随机种子参数，用于保证实验可重现性，默认为1
-    parser.add_argument('--seed', type=int, default=1, help='random seed')
-    # 解析命令行参数
-    args = parser.parse_args()
-    return args
+    # ========================== 3. csmcFL 联合优化与压缩 ==========================
+    parser.add_argument('--strategy', type=str, default='fgs_csmcFL',
+                        choices=['tFL', 'psFL', 'csmcFL', 'dp_fedavg', 'dp_fedavg_comp', 'fgs_csmcFL', 'fgs_fl'],
+                        help='实验策略选择: fgs_csmcFL(Fed-LRP), fgs_fl(原论文无压缩对比)')
+    # 修改 compress_layers 描述，明确 None 的用法
+    parser.add_argument('--compress_layers', type=str, default='fc3',
+                        help='SVD压缩的目标层。设为 None 则执行原论文 fgs_fl 全量加噪模式')
+    parser.add_argument('--compress_rank', type=int, default=10, help='SVD初始秩λ')
+    parser.add_argument('--compress_rank_max', type=int, default=50, help='SVD最大允许秩上限')
+    parser.add_argument('--R_min', type=float, default=5e4, help='csmcFL要求的最小传输速率（bit/s）')
+
+    # ========================== 4. UAV 与 无线信道参数 (论文 Eq.12-15) ==========================
+
+    parser.add_argument('--area_size', type=float, default=200.0, help='GT分布区域 (m)')
+    parser.add_argument('--uav_height', type=float, default=100.0, help='UAV悬停高度 (m)')
+    parser.add_argument('--carrier_freq', type=float, default=2.0e9, help='载波频率 (fc=2GHz)')
+    parser.add_argument('--bandwidth', type=float, default=2.0e6, help='带宽 (B=2MHz)')
+    parser.add_argument('--noise_power', type=float, default=-96.0, help='噪声功率 (N=-96dBm)')
+    parser.add_argument('--gt_power_min', type=float, default=0.0, help='GT最小发射功率 (0dBm)')
+    parser.add_argument('--gt_power_max', type=float, default=10.0, help='GT最大发射功率 (10dBm)')
+
+    # 路径损耗环境参数 (Eq.14)
+    parser.add_argument('--city_a', type=float, default=9.61, help='环境参数 a')
+    parser.add_argument('--city_b', type=float, default=0.16, help='环境参数 b')
+    parser.add_argument('--zeta_los', type=float, default=1.0, help='LoS 附加损耗 (dB)')
+    parser.add_argument('--zeta_nlos', type=float, default=20.0, help='NLoS 附加损耗 (dB)')
+
+    # 实验 6：信道恶化人工干预
+    parser.add_argument('--force_nlos', action='store_true', help='实验6开关：强制固定NLoS概率')
+    parser.add_argument('--nlos_prob', type=float, default=0.2, help='实验6：手动设定的NLoS概率值 (0.2, 0.5, 0.8)')
+
+    # ========================== 5. FGS 与 差异隐私参数 (ESWA 2025) ==========================
+    parser.add_argument('--epsilon', type=float, default=4.0, help='隐私预算 ε')
+    parser.add_argument('--dp_type', type=str, default='gsr',
+                        choices=['grad_clip', 'post_train', 'gsr'],
+                        help='实验8：DP加噪点 (GSR为FGS-FL核心)')
+    parser.add_argument('--rho', type=float, default=0.05, help='FGO平坦化扰动半径')
+
+    # ========================== 6. 算法逻辑开关 (用于消融实验 7) ==========================
+    parser.add_argument('--ablation', type=str, default='all',
+                        choices=['none', 'client_sel', 'compression', 'all'],
+                        help='实验7：none(Base A), client_sel(Base B), compression(Base C), all(完整csmcFL)')
+    parser.add_argument('--target_acc', type=float, default=0.85, help='实验3：评估收敛速度的目标精度')
+
+    # ========================== 7. PSO 优化器参数 ==========================
+    parser.add_argument('--pso_iter', type=int, default=50, help='PSO迭代次数')
+    parser.add_argument('--pso_particles', type=int, default=30, help='PSO粒子数')
+    parser.add_argument('--pso_w', type=float, default=0.7, help='惯性权重')
+    parser.add_argument('--pso_c1', type=float, default=2.0, help='个体因子')
+    parser.add_argument('--pso_c2', type=float, default=2.0, help='全局因子')
+    # ========================== 8. 日志与调试参数 ==========================
+    parser.add_argument('--verbose', type=int, default=1,
+                        help='是否打印详细日志 (1=开启, 0=关闭)')
+    parser.add_argument('--log_dir', type=str, default='../logs', help='Tensorboard 日志目录')
+
+    return parser.parse_args()
+
+    return parser.parse_args()

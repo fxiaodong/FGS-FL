@@ -1,151 +1,189 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Python version: 3.6
-
-# update.py：客户端本地更新与模型评估（FedAvg 核心逻辑）
-# 该文件定义了 客户端本地训练逻辑 和 全局模型评估逻辑，是 FedAvg 算法的 “执行核心”。
-
+import copy
+import numpy as np
 import torch
+import gc
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from fgs_utils import gsr_noise_injection, calculate_dp_sigma
 
-# DatasetSplit：客户端本地数据集封装
-# 将 “全局数据集 + 客户端数据索引” 封装为 PyTorch Dataset，供客户端加载本地数据：
+
 class DatasetSplit(Dataset):
-    """An abstract Dataset class wrapped around Pytorch Dataset class.
-    """
-
     def __init__(self, dataset, idxs):
-        self.dataset = dataset # 全局数据集
-        self.idxs = [int(i) for i in idxs] # 客户端对应的样本索引
+        self.dataset = dataset
+        self.idxs = [int(i) for i in idxs]
 
     def __len__(self):
         return len(self.idxs)
 
-    def __getitem__(self, item):
-        image, label = self.dataset[self.idxs[item]] # 提取客户端本地样本
-        return torch.tensor(image), torch.tensor(label)
+    def __getitem__(self, index):
+        image, label = self.dataset[self.idxs[index]]
+        return image, label
 
-# 客户端本地训练类（对应论文 “ClientUpdate”）
-# 实现论文中 “客户端本地多轮 SGD 训练” 的完整逻辑：
+
 class LocalUpdate(object):
-    def __init__(self, args, dataset, idxs, logger):
+    def __init__(self, args, dataset, idxs, logger=None):
         self.args = args
-        self.logger = logger
-        # 划分客户端本地的“训练集/验证集/测试集”（8:1:1）
-        self.trainloader, self.validloader, self.testloader = self.train_val_test(
-            dataset, list(idxs))
-        self.device = 'cuda' if args.gpu else 'cpu'
-        #  损失函数（对应论文交叉熵损失）
+        self.idxs = list(idxs)
+        self.device = torch.device(f'cuda:{args.gpu}' if args.gpu and args.gpu != 'None' else 'cpu')
+        self.trainloader, self.validloader, self.testloader = self.train_val_test(dataset, self.idxs)
         self.criterion = nn.NLLLoss().to(self.device)
 
     def train_val_test(self, dataset, idxs):
-        """
-        Returns train, validation and test dataloaders for a given dataset
-        and user indexes.
-        """
-        #   # 按 8:1:1 分割客户端本地数据（训练/验证/测试）
-        idxs_train = idxs[:int(0.8*len(idxs))]
-        idxs_val = idxs[int(0.8*len(idxs)):int(0.9*len(idxs))]
-        idxs_test = idxs[int(0.9*len(idxs)):]
-        # 构建 DataLoader
-        trainloader = DataLoader(DatasetSplit(dataset, idxs_train),
-                                 batch_size=self.args.local_bs, shuffle=True)
-        validloader = DataLoader(DatasetSplit(dataset, idxs_val),
-                                 batch_size=int(len(idxs_val)/10), shuffle=False)
-        testloader = DataLoader(DatasetSplit(dataset, idxs_test),
-                                batch_size=int(len(idxs_test)/10), shuffle=False)
+        train_idxs = idxs[:int(0.8 * len(idxs))]
+        val_idxs = idxs[int(0.8 * len(idxs)):int(0.9 * len(idxs))]
+        test_idxs = idxs[int(0.9 * len(idxs)):]
+        base_bs = self.args.local_bs
+        if self.args.iid == 0:
+            base_bs = min(base_bs, 32)
+        local_bs = max(1, min(len(train_idxs), base_bs))
+
+        trainloader = DataLoader(DatasetSplit(dataset, train_idxs), batch_size=local_bs, shuffle=True, num_workers=0,
+                                 pin_memory=True)
+        validloader = DataLoader(DatasetSplit(dataset, val_idxs), batch_size=max(1, len(val_idxs) // 10), num_workers=0,
+                                 pin_memory=True)
+        testloader = DataLoader(DatasetSplit(dataset, test_idxs), batch_size=max(1, len(test_idxs) // 10),
+                                num_workers=0, pin_memory=True)
         return trainloader, validloader, testloader
 
-    def update_weights(self, model, global_round):
-        """客户端本地多轮训练，返回更新后的模型权重和平均损失"""
+    def update_weights(self, model, global_round, compress=False, epsilon=1.0, history=None):
         model.train()
+        model.to(self.device)
+        train_model = copy.deepcopy(model)
+        train_model.train()
+        optimizer = torch.optim.SGD(train_model.parameters(), lr=self.args.lr, momentum=self.args.momentum)
+        use_fgs = 'fgs' in self.args.strategy
+        sigma = calculate_dp_sigma(epsilon) if epsilon > 0 else 0.0
+        C_clip, rho, eta = 1.0, self.args.rho, self.args.lr
         epoch_loss = []
 
-        # 初始化优化器（对应论文 SGD）
-        if self.args.optimizer == 'sgd':
-            optimizer = torch.optim.SGD(model.parameters(), lr=self.args.lr,
-                                        momentum=0.5)
-        elif self.args.optimizer == 'adam':
-            optimizer = torch.optim.Adam(model.parameters(), lr=self.args.lr,
-                                         weight_decay=1e-4)
-        # 本地多轮训练（对应论文 E 轮本地 epoch）
-        for iter in range(self.args.local_ep):
-            batch_loss = []
-            for batch_idx, (images, labels) in enumerate(self.trainloader):
-                images, labels = images.to(self.device), labels.to(self.device)
+        if self.args.strategy == 'fgs_fl':
+            w_initial_params = [p.clone().detach() for p in model.parameters()]
+            local_gradient_stream = []
+            for ep in range(self.args.local_ep):
+                batch_loss = []
+                for i, (images, labels) in enumerate(self.trainloader):
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    optimizer.zero_grad()
+                    output = train_model(images)
+                    loss = self.criterion(output, labels)
+                    loss.backward()
+                    raw_grad = torch.cat([p.grad.flatten().detach() for p in train_model.parameters()])
+                    clipped_grad = raw_grad / max(1.0, float(torch.norm(raw_grad, 2) / C_clip))
+                    flat_grad = clipped_grad
+                    if use_fgs and rho > 0:
+                        original_params = [p.clone().detach() for p in train_model.parameters()]
+                        perturbation = (rho * clipped_grad) / (torch.norm(clipped_grad, 2) + 1e-8)
+                        ptr = 0
+                        for p in train_model.parameters():
+                            numel = p.numel()
+                            p.data.add_(perturbation[ptr:ptr + numel].view(p.shape))
+                            ptr += numel
+                        optimizer.zero_grad()
+                        self.criterion(train_model(images), labels).backward()
+                        flat_grad = torch.cat([p.grad.flatten().detach() for p in train_model.parameters()])
+                        ptr = 0
+                        for p, orig in zip(train_model.parameters(), original_params):
+                            p.data.copy_(orig.data)
+                        del original_params, perturbation
 
-                model.zero_grad()
-                log_probs = model(images)
-                loss = self.criterion(log_probs, labels)# 计算本地损失
-                loss.backward()# 反向传播
-                optimizer.step()# 本地 SGD 更新
+                    if i % 5 == 0:
+                        local_gradient_stream.append(flat_grad.cpu())
 
-                if self.args.verbose and (batch_idx % 10 == 0):
-                    print('| Global Round : {} | Local Epoch : {} | [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                        global_round, iter, batch_idx * len(images),
-                        len(self.trainloader.dataset),
-                        100. * batch_idx / len(self.trainloader), loss.item()))
-                self.logger.add_scalar('loss', loss.item())
-                batch_loss.append(loss.item())
-            epoch_loss.append(sum(batch_loss)/len(batch_loss))# 每 epoch 平均损失
+                    if i % 20 == 0 or i == len(self.trainloader) - 1:
+                        noisy_sum_grad = gsr_noise_injection(local_gradient_stream, self.args.epochs, 10, sigma, C_clip,
+                                                             self.device)
+                        cumulative_update = -eta * noisy_sum_grad.to(self.device)
+                        ptr = 0
+                        for p_init, p_train in zip(w_initial_params, train_model.parameters()):
+                            numel = p_init.numel()
+                            p_train.data.copy_(p_init.data + cumulative_update[ptr:ptr + numel].view(p_init.shape))
+                            ptr += numel
+                    batch_loss.append(loss.item())
+                    if i % 20 == 0:
+                        print(f"| User Train | Ep: {ep} Batch: {i}/{len(self.trainloader)} | Loss: {loss.item():.4f}")
+                epoch_loss.append(np.mean(batch_loss))
+                torch.cuda.empty_cache()
+            final_state = {k: v.cpu() for k, v in train_model.state_dict().items()}
+            del local_gradient_stream, w_initial_params, train_model
+            gc.collect()
+            torch.cuda.empty_cache()
+            return {'state': final_state, 'n_samples': len(self.idxs)}, np.mean(epoch_loss), None
 
-        return model.state_dict(), sum(epoch_loss) / len(epoch_loss)
+        else:
+            for ep in range(self.args.local_ep):
+                batch_loss = []
+                for i, (images, labels) in enumerate(self.trainloader):
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    optimizer.zero_grad()
+                    output = train_model(images)
+                    loss = self.criterion(output, labels)
+                    loss.backward()
+                    if use_fgs and self.args.rho > 0:
+                        raw_grad = torch.cat([p.grad.flatten().detach() for p in train_model.parameters()])
+                        scale = torch.max(torch.tensor(1.0, device=self.device), torch.norm(raw_grad, 2) / C_clip)
+                        clipped_grad = raw_grad / scale
+                        perturbation = self.args.rho * clipped_grad / (torch.norm(clipped_grad, 2) + 1e-8)
+                        ptr = 0
+                        for p in train_model.parameters():
+                            p.data.add_(perturbation[ptr:ptr + p.numel()].view(p.shape))
+                            ptr += p.numel()
+                        optimizer.zero_grad()
+                        self.criterion(train_model(images), labels).backward()
+                        flat_grad = torch.cat([p.grad.flatten().detach() for p in train_model.parameters()])
+                        ptr = 0
+                        for p in train_model.parameters():
+                            numel = p.numel()
+                            p.data.sub_(perturbation[ptr:ptr + numel].view(p.shape))
+                            p.grad.data = flat_grad[ptr:ptr + numel].view(p.shape)
+                            ptr += numel
+                        del perturbation
+                    torch.nn.utils.clip_grad_norm_(train_model.parameters(), max_norm=C_clip)
+                    optimizer.step()
+                    batch_loss.append(loss.item())
+                    if i % 20 == 0:
+                        print(
+                            f"| User Train (Main) | Ep: {ep} Batch: {i}/{len(self.trainloader)} | Loss: {loss.item():.4f}")
+                epoch_loss.append(np.mean(batch_loss))
+                torch.cuda.empty_cache()
 
-    def inference(self, model):
-        """ 客户端本地评估（返回准确率和损失）
-        """
+            initial_state = model.state_dict()
+            final_state = train_model.state_dict()
+            upload_state = {}
+            target_layers = self.args.compress_layers.split(',') if (
+                        compress and self.args.compress_layers != 'None') else []
+            for name, W_target in final_state.items():
+                W_init, W_final = initial_state[name].cpu().float(), W_target.cpu().float()
+                delta = W_final - W_init
+                if any(lyr in name for lyr in target_layers) and name.endswith('.weight'):
+                    U, s, Vh = torch.linalg.svd(delta, full_matrices=False)
+                    k = min(self.args.compress_rank, min(delta.shape))
+                    w1, w2 = U[:, :k] @ torch.diag(torch.sqrt(s[:k])), torch.diag(torch.sqrt(s[:k])) @ Vh[:k, :]
+                    if epsilon > 0:
+                        w1 += torch.randn_like(w1) * (sigma * 0.5)
+                        w2 += torch.randn_like(w2) * (sigma * 0.5)
+                    upload_state[name] = W_init + (w1 @ w2)
+                else:
+                    upload_state[name] = W_final
+            del train_model
+            gc.collect()
+            torch.cuda.empty_cache()
+            return {'state': upload_state, 'n_samples': len(self.idxs)}, np.mean(epoch_loss), None
 
-        model.eval()
-        loss, total, correct = 0.0, 0.0, 0.0
 
-        for batch_idx, (images, labels) in enumerate(self.testloader):
-            images, labels = images.to(self.device), labels.to(self.device)
-
-            # Inference
-            '''这段代码的功能是：
-            模型推理：outputs = model(images) - 将输入图像数据传入模型进行前向传播，得到预测输出
-            计算损失：batch_loss = self.criterion(outputs, labels) - 使用预定义的损失函数计算当前批次的预测损失
-            累积损失：loss += batch_loss.item() - 将当前批次损失值累加到总损失中，用于后续的统计和优化'''
-            outputs = model(images)
-            batch_loss = self.criterion(outputs, labels)
-            loss += batch_loss.item()
-
-            #  计算准确率
-            _, pred_labels = torch.max(outputs, 1)
-            pred_labels = pred_labels.view(-1)
-            correct += torch.sum(torch.eq(pred_labels, labels)).item()
-            total += len(labels)
-
-        accuracy = correct/total
-        return accuracy, loss
-
-# 全局模型测试（对应论文 “测试集评估”）
+# --- 这里是补回的 test_inference 函数 ---
 def test_inference(args, model, test_dataset):
-    """ 在全局测试集上评估聚合后的模型性能，返回准确率和损失.
-    """
-
     model.eval()
-    loss, total, correct = 0.0, 0.0, 0.0
-
-    device = 'cuda' if args.gpu else 'cpu'
-    criterion = nn.NLLLoss().to(device)
-    testloader = DataLoader(test_dataset, batch_size=128,
-                            shuffle=False)
-
-    for batch_idx, (images, labels) in enumerate(testloader):
-        images, labels = images.to(device), labels.to(device)
-
-        # Inference
-        outputs = model(images)
-        batch_loss = criterion(outputs, labels)
-        loss += batch_loss.item()
-
-        #  计算准确率
-        _, pred_labels = torch.max(outputs, 1)
-        pred_labels = pred_labels.view(-1)
-        correct += torch.sum(torch.eq(pred_labels, labels)).item()
-        total += len(labels)
-
-    accuracy = correct/total
-    return accuracy, loss
+    device = torch.device(f'cuda:{args.gpu}' if args.gpu and args.gpu != 'None' else 'cpu')
+    model.to(device)
+    testloader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+    correct, total = 0, 0
+    with torch.no_grad():
+        for images, labels in testloader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, pred = torch.max(outputs, 1)
+            correct += (pred == labels).sum().item()
+            total += labels.size(0)
+    return correct / total, 0.0

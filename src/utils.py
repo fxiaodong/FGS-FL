@@ -1,110 +1,140 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-# Python version: 3.6
-
-# 数据集加载 + 权重聚合
-
 import copy
 import torch
+import numpy as np
+from torch import nn
 from torchvision import datasets, transforms
-from sampling import mnist_iid, mnist_noniid, mnist_noniid_unequal
-from sampling import cifar_iid, cifar_noniid
+from sampling import mnist_iid, mnist_noniid, mnist_noniid_unequal, cifar_iid, cifar_noniid
+from models import (replace_fc_with_lowrank, get_fc_rank, get_fc_layer,
+                    CNNCifar, CNNMnist, CNNFashion_Mnist, MLP, LeNet5, AlexNet)
+from uav_utils import init_gt_coords, pso_uav_optimize
 
-# 加载数据集并划分客户端数据
+
 def get_dataset(args):
-    """ Returns train and test datasets and a user group which is a dict where
-    the keys are the user index and the values are the corresponding data for
-    each of those users.
-    """
-
     if args.dataset == 'cifar':
-        # CIFAR-10 数据加载与预处理
         data_dir = '../data/cifar/'
-        # 定义数据预处理变换：转换为张量并进行标准化
-        apply_transform = transforms.Compose(
-            [transforms.ToTensor(),
-             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-
-        # 创建CIFAR-10训练数据集
-        train_dataset = datasets.CIFAR10(data_dir, train=True, download=True,
-                                         transform=apply_transform)
-
-        # 创建CIFAR-10测试数据集
-        test_dataset = datasets.CIFAR10(data_dir, train=False, download=True,
-                                        transform=apply_transform)
-
-        # 根据配置将训练数据分发给不同用户
-        if args.iid:
-            # IID模式：独立同分布地将用户数据从CIFAR-10数据集中采样
-            user_groups = cifar_iid(train_dataset, args.num_users)
-        else:
-            # Non-IID模式：非独立同分布地将用户数据从CIFAR-10数据集中采样
-            if args.unequal:
-                # 为每个用户选择不等比例的数据分割
-                raise NotImplementedError()
-            else:
-                # 为每个用户选择相等比例的数据分割
-                user_groups = cifar_noniid(train_dataset, args.num_users)
-    # MNIST/FMNIST 数据加载（28×28 灰度图）
-    elif args.dataset == 'mnist' or 'fmnist':
-        if args.dataset == 'mnist':
-            data_dir = '../data/mnist/'
-        else:
-            data_dir = '../data/fmnist/'
-
         apply_transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))])
-
-        train_dataset = datasets.MNIST(data_dir, train=True, download=True,
-                                       transform=apply_transform)
-
-        test_dataset = datasets.MNIST(data_dir, train=False, download=True,
-                                      transform=apply_transform)
-
-        # sample training data amongst users
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+        train_dataset = datasets.CIFAR10(data_dir, train=True, download=True, transform=apply_transform)
+        test_dataset = datasets.CIFAR10(data_dir, train=False, download=True, transform=apply_transform)
+        args.num_channels = 3
         if args.iid:
-            # Sample IID user data from Mnist
-            user_groups = mnist_iid(train_dataset, args.num_users)
+            raw_groups = cifar_iid(train_dataset, args.num_users)
         else:
-            # Sample Non-IID user data from Mnist
-            if args.unequal:
-                # Chose uneuqal splits for every user
-                user_groups = mnist_noniid_unequal(train_dataset, args.num_users)
-            else:
-                # Chose euqal splits for every user
-                user_groups = mnist_noniid(train_dataset, args.num_users)
+            raw_groups = cifar_noniid(train_dataset, args.num_users, classes_per_user=args.classes_per_user)
+    else:
+        data_dir = f'../data/{args.dataset}/'
+        dataset_cls = datasets.MNIST if args.dataset == 'mnist' else datasets.FashionMNIST
+        apply_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))
+        ])
+        train_dataset = dataset_cls(data_dir, train=True, download=True, transform=apply_transform)
+        test_dataset = dataset_cls(data_dir, train=False, download=True, transform=apply_transform)
+        args.num_channels = 1
+        if args.iid:
+            raw_groups = mnist_iid(train_dataset, args.num_users)
+        else:
+            raw_groups = mnist_noniid(train_dataset, args.num_users, classes_per_user=args.classes_per_user)
 
+    user_groups = {int(k): list(v) for k, v in raw_groups.items()}
     return train_dataset, test_dataset, user_groups
 
-# 聚合客户端权重（对应论文 “服务器加权平均”）
-'''论文中是 “按客户端数据量 \(n_k/n\) 加权平均”，
-此处简化为 “按客户端数量平均”，但核心逻辑一致（均为聚合客户端模型参数）。'''
-def average_weights(w):
-    """
-    Returns the average of the weights.
-    """
-    w_avg = copy.deepcopy(w[0]) # 初始化平均权重
-    for key in w_avg.keys():
-        for i in range(1, len(w)):
-            w_avg[key] += w[i][key]# 累加所有客户端权重
-        w_avg[key] = torch.div(w_avg[key], len(w)) # 按客户端数量平均
-    return w_avg
 
-# 打印实验的详细配置信息
-def exp_details(args):
-    print('\nExperimental details:')
-    print(f'    Model     : {args.model}')
-    print(f'    Optimizer : {args.optimizer}')
-    print(f'    Learning  : {args.lr}')
-    print(f'    Global Rounds   : {args.epochs}\n')
+def init_uav_and_gt(args):
+    gt_coords, gt_powers = init_gt_coords(args)
+    uav_coord, gt_rates = pso_uav_optimize(args, gt_coords, gt_powers)
+    gt_rates = np.maximum(gt_rates, 1.0)
+    return uav_coord, gt_coords, gt_rates
 
-    print('    Federated parameters:')
-    if args.iid:
-        print('    IID')
+
+def aggregate_payloads(payloads):
+    if not payloads: return {}
+    total_samples = sum(int(p.get('n_samples', 1)) for p in payloads)
+    agg_state = {}
+    for p in payloads:
+        state = p['state']
+        weight = float(p.get('n_samples', 1)) / float(total_samples)
+        user_restored_state = {}
+        compressed_keys = set()
+
+        # 1. 解压：处理 SVD 分解的权重
+        for k in state.keys():
+            if '.W1' in k:
+                base_name = k.replace('.W1', '')
+                if base_name + '.W2' in state:
+                    w1 = state[base_name + '.W1']
+                    w2 = state[base_name + '.W2']
+                    user_restored_state[base_name + '.weight'] = torch.matmul(w1, w2)
+                    compressed_keys.add(base_name + '.W1')
+                    compressed_keys.add(base_name + '.W2')
+
+        # 2. 合并：加入 bias、BN 参数和未压缩的层
+        for k, v in state.items():
+            if k not in compressed_keys:
+                user_restored_state[k] = v
+
+        # 3. 聚合所有参数（包括 BN 的 running_mean 等）
+        for k, v in user_restored_state.items():
+            if k not in agg_state:
+                agg_state[k] = v.float() * weight
+            else:
+                agg_state[k] += v.float() * weight
+    return agg_state
+
+
+def build_global_model(args):
+    if args.model == 'cnn':
+        if args.dataset == 'cifar':
+            model = AlexNet(args)
+        elif args.dataset in ['mnist', 'fmnist']:
+            model = LeNet5(args)
+        else:
+            model = CNNCifar(args)
+    elif args.model == 'lenet':
+        model = LeNet5(args)
+    elif args.model == 'alexnet':
+        model = AlexNet(args)
+    elif args.model == 'mlp':
+        dim_in = 3072 if args.dataset == 'cifar' else 784
+        model = MLP(dim_in=dim_in, dim_hidden=64, dim_out=args.num_classes)
     else:
-        print('    Non-IID')
-    print(f'    Fraction of users  : {args.frac}')
-    print(f'    Local Batch size   : {args.local_bs}')
-    print(f'    Local Epochs       : {args.local_ep}\n')
-    return
+        raise ValueError(f"Unknown model: {args.model}")
+    return model.to(torch.device('cuda' if args.gpu and args.gpu != 'None' else 'cpu'))
+
+
+def choose_optimal_ro(args, gt_rates, model_size_bits):
+    candidate_ro = np.unique(gt_rates[gt_rates > 0])
+    if candidate_ro.size == 0: return np.mean(gt_rates), np.ones(args.num_users), 0
+    min_time, optimal_ro, optimal_X = float('inf'), float(np.mean(gt_rates)), np.ones(args.num_users)
+    for ro in candidate_ro:
+        X = (gt_rates >= ro).astype(int)
+        if X.sum() == 0: continue
+        T = calculate_fl_time(args, X, gt_rates, model_size_bits)
+        if T < min_time:
+            min_time, optimal_ro, optimal_X = T, float(ro), X.copy()
+    return optimal_ro, optimal_X, min_time
+
+
+def calculate_fl_time(args, X, gt_rates, model_size_bits):
+    model = build_global_model(args)
+    # fc_layer = get_fc_layer(model, args.compress_layers)
+    # 修改为只取第一层名，避免解析失败
+    first_layer = args.compress_layers.split(',')[0].strip()
+    fc_layer = get_fc_layer(model, first_layer)
+    lambda_total = max(1, get_fc_rank(fc_layer))
+    eta = float(args.compress_rank) / lambda_total
+    T_list = []
+    for m in range(args.num_users):
+        rate_m = max(float(gt_rates[m]), 1.0)
+        upload_size = model_size_bits * X[m] + (model_size_bits * eta) * (1 - X[m])
+        T_list.append(6.0 + upload_size / rate_m)
+    return float(np.mean(T_list))
+
+
+def exp_details(args):
+    print(f"\n策略: {args.strategy} | 模型: {args.model} | 数据集: {args.dataset}")
+    print(f"IID: {'是' if args.iid else '否'} | 每个用户类别数: {args.classes_per_user if not args.iid else 'N/A'}")
+    print(f"压缩层: {args.compress_layers} | 目标秩: {args.compress_rank}")
+    print(f"隐私预算 ε: {args.epsilon} | 噪声类型: {args.dp_type}\n")
