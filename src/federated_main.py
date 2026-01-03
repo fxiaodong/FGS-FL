@@ -86,8 +86,19 @@ def main():
     total_bits = 0.0
     best_acc = 0.0
 
+    # ========== 停止条件参数（支持动态配置） ==========
+    # 可通过命令行参数传递（需在options.py中添加对应配置），这里默认值仅为示例
+    target_acc = args.target_acc if hasattr(args, 'target_acc') else 0.85  # 目标准确率
+    convergence_threshold = args.conv_threshold if hasattr(args, 'conv_threshold') else 1e-4  # 损失变化阈值
+    patience = args.patience if hasattr(args, 'patience') else 3  # 连续满足收敛条件的轮数
+    recent_test_losses = []  # 存储最近几轮的测试损失
+    stop_training = False  # 停止标志
+
     # ========== 4. Training Loop ==========
     for epoch in range(args.epochs):
+        if stop_training:
+            break  # 满足条件时提前退出（优先于轮数停止）
+
         # 学习率衰减策略
         if epoch > 0 and epoch % 20 == 0:
             new_lr = args.lr * 0.7
@@ -109,7 +120,6 @@ def main():
 
         for idx in selected_users:
             # 判定当前用户是否执行压缩
-            # 逻辑：非预热期 & 策略开启压缩 & PSO 判定该用户信道差 (X=0)
             is_comp = False if epoch < 40 else (
                         not is_lrp_disabled and args.strategy in ['csmcFL', 'fgs_csmcFL'] and args.optimal_X[idx] == 0)
             if is_comp: comp_user_count += 1
@@ -148,6 +158,25 @@ def main():
         print(f'   [Stat] Test Acc: {acc:.2%} | Best: {best_acc:.2%} | Comm: {total_bits / 1e6:.2f}Mb' +
               (f" | CompUsers: {comp_user_count}" if epoch >= 40 else ""))
 
+        # ========== 停止条件判断（核心逻辑） ==========
+        # 1. 记录最近patience轮的测试损失
+        recent_test_losses.append(test_loss)
+        if len(recent_test_losses) > patience:
+            recent_test_losses.pop(0)
+
+        # 2. 判断是否满足“准确率达标 + 模型收敛”
+        is_accurate = acc >= target_acc
+        is_converged = False
+        if len(recent_test_losses) == patience:
+            loss_diff = max(recent_test_losses) - min(recent_test_losses)
+            is_converged = loss_diff < convergence_threshold
+            print(f'   [Convergence] Recent loss diff: {loss_diff:.6f} (converged: {is_converged})')
+
+        # 3. 满足条件则停止（无论是否达到最大轮数）
+        if is_accurate and is_converged:
+            print(f'\n>>> 满足停止条件：准确率达标({acc:.2%})且模型收敛，提前终止训练')
+            stop_training = True
+
         # 还原 Rank
         args.compress_rank = original_rank
 
@@ -156,12 +185,11 @@ def main():
     if not os.path.exists(save_dir): os.makedirs(save_dir)
     timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
     iid_tag = 'iid' if args.iid else 'noniid'
-    # 文件名增加 rho 标识，方便绘图脚本自动识别消融实验
     file_name = f"{args.strategy}_{args.dataset}_{iid_tag}_eps{args.epsilon}_rho{args.rho}_rank{args.compress_rank}_{timestamp}.pth"
 
     results = {'args': vars(args), 'test_acc': test_acc_list, 'cumulative_bits': cumulative_bits_list}
     torch.save(results, os.path.join(save_dir, file_name))
-    print(f"\nTraining Finished. Max Acc: {max(test_acc_list):.2%}")
+    print(f"\nTraining Finished. Max Acc: {max(test_acc_list):.2%} | Total Rounds: {len(test_acc_list)}")
 
 
 if __name__ == '__main__':

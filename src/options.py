@@ -71,7 +71,8 @@ def args_parser():
                         choices=['none', 'client_sel', 'compression', 'all'],
                         help='实验7：none(Base A), client_sel(Base B), compression(Base C), all(完整csmcFL)')
     parser.add_argument('--target_acc', type=float, default=0.85, help='实验3：评估收敛速度的目标精度')
-
+    parser.add_argument('--conv_threshold', type=float, default=1e-4, help='收敛判定的损失变化阈值（默认1e-4）')
+    parser.add_argument('--patience', type=int, default=3, help='连续满足收敛条件的轮数（默认3轮）')
     # ========================== 7. PSO 优化器参数 ==========================
     parser.add_argument('--pso_iter', type=int, default=50, help='PSO迭代次数')
     parser.add_argument('--pso_particles', type=int, default=30, help='PSO粒子数')
