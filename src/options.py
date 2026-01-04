@@ -70,7 +70,7 @@ def args_parser():
     parser.add_argument('--ablation', type=str, default='all',
                         choices=['none', 'client_sel', 'compression', 'all'],
                         help='实验7：none(Base A), client_sel(Base B), compression(Base C), all(完整csmcFL)')
-    parser.add_argument('--target_acc', type=float, default=0.85, help='实验3：评估收敛速度的目标精度')
+    parser.add_argument('--target_acc', type=float, default=0.90, help='实验3：评估收敛速度的目标精度')
 
     # ========================== 7. PSO 优化器参数 ==========================
     parser.add_argument('--pso_iter', type=int, default=50, help='PSO迭代次数')
