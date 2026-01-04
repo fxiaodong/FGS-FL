@@ -40,7 +40,6 @@ def args_parser():
     parser.add_argument('--R_min', type=float, default=5e4, help='csmcFL要求的最小传输速率（bit/s）')
 
     # ========================== 4. UAV 与 无线信道参数 (论文 Eq.12-15) ==========================
-
     parser.add_argument('--area_size', type=float, default=200.0, help='GT分布区域 (m)')
     parser.add_argument('--uav_height', type=float, default=100.0, help='UAV悬停高度 (m)')
     parser.add_argument('--carrier_freq', type=float, default=2.0e9, help='载波频率 (fc=2GHz)')
@@ -70,7 +69,11 @@ def args_parser():
     parser.add_argument('--ablation', type=str, default='all',
                         choices=['none', 'client_sel', 'compression', 'all'],
                         help='实验7：none(Base A), client_sel(Base B), compression(Base C), all(完整csmcFL)')
-    parser.add_argument('--target_acc', type=float, default=0.90, help='实验3：评估收敛速度的目标精度')
+    parser.add_argument('--target_acc', type=float, default=0.85, help='实验3：评估收敛速度的目标精度')
+    # 新增：收敛判定的损失变化阈值（默认1e-4，可通过命令行修改）
+    parser.add_argument('--conv_threshold', type=float, default=1e-4, help='收敛判定的损失变化阈值（默认1e-4）')
+    # 新增：连续满足收敛条件的轮数（默认3轮）
+    parser.add_argument('--patience', type=int, default=3, help='连续满足收敛条件的轮数（默认3轮）')
 
     # ========================== 7. PSO 优化器参数 ==========================
     parser.add_argument('--pso_iter', type=int, default=50, help='PSO迭代次数')
@@ -78,11 +81,10 @@ def args_parser():
     parser.add_argument('--pso_w', type=float, default=0.7, help='惯性权重')
     parser.add_argument('--pso_c1', type=float, default=2.0, help='个体因子')
     parser.add_argument('--pso_c2', type=float, default=2.0, help='全局因子')
+
     # ========================== 8. 日志与调试参数 ==========================
     parser.add_argument('--verbose', type=int, default=1,
                         help='是否打印详细日志 (1=开启, 0=关闭)')
     parser.add_argument('--log_dir', type=str, default='../logs', help='Tensorboard 日志目录')
-
-    return parser.parse_args()
 
     return parser.parse_args()
