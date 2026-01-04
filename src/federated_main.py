@@ -89,7 +89,7 @@ def main():
     # ========== 停止条件参数（支持动态配置） ==========
     # 可通过命令行参数传递（需在options.py中添加对应配置），这里默认值仅为示例
     target_acc = args.target_acc if hasattr(args, 'target_acc') else 0.85  # 目标准确率
-    convergence_threshold = args.conv_threshold if hasattr(args, 'conv_threshold') else 1e-4  # 损失变化阈值
+    convergence_threshold = args.conv_threshold if hasattr(args, 'conv_threshold') else 1e-2  # 损失变化阈值
     patience = args.patience if hasattr(args, 'patience') else 3  # 连续满足收敛条件的轮数
     recent_test_losses = []  # 存储最近几轮的测试损失
     stop_training = False  # 停止标志
